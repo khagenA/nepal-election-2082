@@ -5,27 +5,27 @@ import re
 import asyncio
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from bs4 import BeautifulSoup
-
-# ── DO NOT use nest_asyncio — incompatible with Python 3.13 + uvicorn ─────────
-# Instead we run the async fetch in a dedicated fresh thread with its own loop.
-import threading
 
 PAGE = 'https://result.election.gov.np/PRVoteChartResult2082.aspx'
 TOTAL_PR_SEATS = 110
 
+# ── Official / widely recognised Nepal party brand colors ─────────────────────
+# RSP=sky-blue  NC=red  UML=orange  NCP/Maoist=deep-red  RPP=purple
+# JSP=green  Shram=teal  Loktantrik=slate  JanaMorcha=crimson  Others=grey
 PARTY_COLORS = [
-    ('#1565C0', ['स्वतन्त्र']),
-    ('#C62828', ['काँग्रेस']),
-    ('#E65100', ['मार्क्सवादी', 'एमाले']),
-    ('#2E7D32', ['कम्युनिष्ट', 'माओवादी']),
-    ('#6A1B9A', ['प्रजातन्त्र']),
-    ('#00838F', ['श्रम']),
-    ('#F9A825', ['समाजवादी']),
-    ('#37474F', ['लोकतान्त्रिक']),
-    ('#AD1457', ['जनमोर्चा']),
-    ('#4527A0', ['राप्रपा']),
+    ('#1E88E5', ['स्वतन्त्र']),              # RSP   — sky blue
+    ('#2E7D32', ['काँग्रेस']),               # NC    — green
+    ('#EF6C00', ['मार्क्सवादी', 'एमाले']),   # UML   — orange
+    ('#B71C1C', ['माओवादी', 'कम्युनिष्ट']),  # NCP   — deep red
+    ('#FDD835', ['प्रजातन्त्र']),            # RPP   — yellow
+    ('#2E7D32', ['समाजवादी', 'जनता']),       # JSP   — green
+    ('#7B1FA2', ['श्रम']),                   # Shram — purple
+    ('#37474F', ['लोकतान्त्रिक']),           # Loktantrik — slate
+    ('#880E4F', ['जनमोर्चा']),               # Jana Morcha — crimson
+    ('#F57F17', ['राप्रपा']),                # Rastriya — amber
 ]
 EXTRA_COLORS = ['#546E7A','#795548','#5D4037','#607D8B','#78909C','#8D6E63','#A1887F']
 
@@ -60,7 +60,7 @@ def assign_color(name, used):
             return c
     return '#9E9E9E'
 
-# ── Async fetch — runs in its own thread with a clean event loop ───────────────
+# ── Async fetch in isolated thread ────────────────────────────────────────────
 async def _fetch():
     from playwright.async_api import async_playwright
     async with async_playwright() as pw:
@@ -79,8 +79,8 @@ async def _fetch():
         html = await page.content()
         await browser.close()
 
-    soup  = BeautifulSoup(html, 'html.parser')
-    rows  = soup.select('.chart-result-row')
+    soup = BeautifulSoup(html, 'html.parser')
+    rows = soup.select('.chart-result-row')
     parties, votes = [], []
     for row in rows:
         n = row.select_one('.result-label')
@@ -96,7 +96,6 @@ async def _fetch():
     return parties, votes
 
 def fetch_live():
-    """Run async fetch in a brand-new thread + event loop — safe on all Python versions."""
     result = {}
     def runner():
         loop = asyncio.new_event_loop()
@@ -116,7 +115,6 @@ def fetch_live():
 
 # ── Seat allocation ───────────────────────────────────────────────────────────
 def allocate_seats(df, total_seats=110):
-    """Largest Remainder (Hamilton) method. Only parties >= 3% qualify."""
     eligible = df[df['Percentage'] >= 3.0].copy()
     quota = total_seats / eligible['Votes'].sum()
     eligible['ExactSeats'] = eligible['Votes'] * quota
@@ -127,6 +125,34 @@ def allocate_seats(df, total_seats=110):
     eligible.loc[top_idx, 'BaseSeats'] += 1
     eligible['Seats'] = eligible['BaseSeats'].astype(int)
     return eligible[['Party','Votes','Percentage','Color','Seats']].reset_index(drop=True)
+
+# ── Mobile-friendly chart layout helper ──────────────────────────────────────
+def mobile_layout(title_text, center_text, height):
+    return dict(
+        title=dict(
+            text=title_text,
+            x=0.5, xanchor='center',
+            font=dict(size=14, family='Georgia'),
+        ),
+        annotations=[dict(
+            text=center_text,
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=12, color='#222', family='Georgia'),
+        )],
+        # Legend BELOW chart on mobile — horizontal
+        legend=dict(
+            orientation='h',
+            x=0.5, xanchor='center',
+            y=-0.25,
+            font=dict(size=10),
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#ddd', borderwidth=1,
+        ),
+        margin=dict(t=100, b=160, l=10, r=10),
+        height=height,
+        paper_bgcolor='#FAFAFA',
+        autosize=True,
+    )
 
 # ── Chart builders ────────────────────────────────────────────────────────────
 def build_charts(parties, votes):
@@ -141,74 +167,83 @@ def build_charts(parties, votes):
     df = df.sort_values('Votes', ascending=False).reset_index(drop=True)
     timestamp = datetime.now().strftime('%d %b %Y, %H:%M NPT')
 
-    # Chart 1 — vote share, Others grouping
+    # ── Chart 1: vote share with Others ──────────────────────────────────────
     major  = df[df['Percentage'] >= 3.0].copy()
     others = df[df['Percentage'] <  3.0]
     if not others.empty:
         chart1_df = pd.concat([major, pd.DataFrame([{
-            'Party': 'Others (< 3%)', 'Votes': others['Votes'].sum(),
-            'Color': '#9E9E9E', 'Percentage': round(others['Percentage'].sum(), 2)
+            'Party': 'Others (< 3%)',
+            'Votes': others['Votes'].sum(),
+            'Color': '#9E9E9E',
+            'Percentage': round(others['Percentage'].sum(), 2)
         }])], ignore_index=True)
     else:
         chart1_df = major.copy()
     chart1_df = chart1_df.sort_values('Votes', ascending=False).reset_index(drop=True)
 
-    hover1 = [f"<b>{r['Party']}</b><br>Votes: {r['Votes']:,}<br>Share: {r['Percentage']:.2f}%"
-              for _, r in chart1_df.iterrows()]
-
+    hover1 = [
+        f"<b>{r['Party']}</b><br>Votes: {r['Votes']:,}<br>Share: {r['Percentage']:.2f}%"
+        for _, r in chart1_df.iterrows()
+    ]
     fig1 = go.Figure(go.Pie(
-        labels=chart1_df['Party'], values=chart1_df['Votes'], hole=0.42,
-        hovertemplate="%{customdata}<extra></extra>", customdata=hover1,
-        texttemplate="<b>%{percent:.1%}</b>", textposition='inside',
+        labels=chart1_df['Party'],
+        values=chart1_df['Votes'],
+        hole=0.42,
+        hovertemplate="%{customdata}<extra></extra>",
+        customdata=hover1,
+        texttemplate="<b>%{percent:.1%}</b>",
+        textposition='inside',
         insidetextorientation='radial',
-        marker=dict(colors=chart1_df['Color'].tolist(), line=dict(color='white', width=2.5)),
-        pull=[0.07 if i==0 else 0 for i in range(len(chart1_df))],
+        marker=dict(
+            colors=chart1_df['Color'].tolist(),
+            line=dict(color='white', width=2)
+        ),
+        pull=[0.06 if i == 0 else 0 for i in range(len(chart1_df))],
         sort=False, direction='clockwise', rotation=90,
     ))
-    fig1.update_layout(
-        title=dict(
-            text=(f"<b>Chart 1 — PR Vote Share</b><br>"
-                  f"<sup>जम्मा मत: {total_votes:,} &nbsp;|&nbsp; 🔴 LIVE &nbsp;|&nbsp; {timestamp}</sup>"),
-            x=0.5, xanchor='center', font=dict(size=15, family='Georgia')),
-        annotations=[dict(text=f"जम्मा मत<br><b>{total_votes/1e6:.2f}M</b>",
-                          x=0.5, y=0.5, showarrow=False,
-                          font=dict(size=13, color='#222', family='Georgia'))],
-        legend=dict(orientation='v', x=1.01, y=0.5, font=dict(size=11),
-                    bgcolor='rgba(255,255,255,0.9)', bordercolor='#ddd', borderwidth=1),
-        margin=dict(t=110, b=50, l=30, r=230),
-        height=580, paper_bgcolor='#FAFAFA',
-    )
+    fig1.update_layout(**mobile_layout(
+        title_text=(
+            f"<b>PR Vote Share</b><br>"
+            f"<sup>जम्मा मत: {total_votes:,} &nbsp;|&nbsp; 🔴 LIVE &nbsp;|&nbsp; {timestamp}</sup>"
+        ),
+        center_text=f"जम्मा मत<br><b>{total_votes/1e6:.2f}M</b>",
+        height=560,
+    ))
 
-    # Chart 2 — 110 seats, no Others
+    # ── Chart 2: 110 seats, no Others ────────────────────────────────────────
     seats_df = allocate_seats(df, TOTAL_PR_SEATS)
     seats_df = seats_df.sort_values('Seats', ascending=False).reset_index(drop=True)
 
-    hover2 = [f"<b>{r['Party']}</b><br>Seats: {r['Seats']}<br>Vote share: {r['Percentage']:.2f}%"
-              for _, r in seats_df.iterrows()]
-
+    hover2 = [
+        f"<b>{r['Party']}</b><br>Seats: {r['Seats']}<br>Vote share: {r['Percentage']:.2f}%"
+        for _, r in seats_df.iterrows()
+    ]
     fig2 = go.Figure(go.Pie(
-        labels=seats_df['Party'], values=seats_df['Seats'], hole=0.42,
-        hovertemplate="%{customdata}<extra></extra>", customdata=hover2,
-        texttemplate="<b>%{label}</b><br>%{value} seats", textposition='outside',
-        marker=dict(colors=seats_df['Color'].tolist(), line=dict(color='white', width=2.5)),
-        pull=[0.07 if i==0 else 0 for i in range(len(seats_df))],
+        labels=seats_df['Party'],
+        values=seats_df['Seats'],
+        hole=0.42,
+        hovertemplate="%{customdata}<extra></extra>",
+        customdata=hover2,
+        texttemplate="<b>%{value}</b>",
+        textposition='inside',
+        insidetextorientation='radial',
+        marker=dict(
+            colors=seats_df['Color'].tolist(),
+            line=dict(color='white', width=2)
+        ),
+        pull=[0.06 if i == 0 else 0 for i in range(len(seats_df))],
         sort=False, direction='clockwise', rotation=90,
     ))
-    fig2.update_layout(
-        title=dict(
-            text=(f"<b>Chart 2 — 110 PR Seat Allocation</b><br>"
-                  f"<sup>Parties ≥ 3% · Largest Remainder method · {timestamp}</sup>"),
-            x=0.5, xanchor='center', font=dict(size=15, family='Georgia')),
-        annotations=[dict(text=f"<b>{TOTAL_PR_SEATS}</b><br>PR Seats",
-                          x=0.5, y=0.5, showarrow=False,
-                          font=dict(size=14, color='#222', family='Georgia'))],
-        legend=dict(orientation='v', x=1.01, y=0.5, font=dict(size=11),
-                    bgcolor='rgba(255,255,255,0.9)', bordercolor='#ddd', borderwidth=1),
-        margin=dict(t=110, b=80, l=30, r=230),
-        height=600, paper_bgcolor='#FAFAFA',
-    )
+    fig2.update_layout(**mobile_layout(
+        title_text=(
+            f"<b>110 PR Seat Allocation</b><br>"
+            f"<sup>Parties ≥ 3% &nbsp;|&nbsp; Largest Remainder method &nbsp;|&nbsp; {timestamp}</sup>"
+        ),
+        center_text=f"<b>{TOTAL_PR_SEATS}</b><br>PR Seats",
+        height=580,
+    ))
 
-    # Summary table
+    # ── Summary table ─────────────────────────────────────────────────────────
     summary = seats_df[['Party','Votes','Percentage','Seats']].copy()
     summary.columns = ['Party','Votes','Vote %','PR Seats (110)']
     summary['Votes']  = summary['Votes'].apply(lambda x: f'{x:,}')
@@ -231,32 +266,71 @@ def refresh_data():
         empty.update_layout(paper_bgcolor='#FAFAFA')
         return empty, empty, pd.DataFrame(), msg
 
-# ── Gradio UI ─────────────────────────────────────────────────────────────────
+# ── CSS — mobile-first responsive ────────────────────────────────────────────
 CSS = """
+/* ── Mobile first ── */
+* { box-sizing: border-box; }
 body { font-family: Georgia, serif !important; background: #F0F2F5; }
-.gradio-container { max-width: 1100px !important; margin: 0 auto !important; }
-#title    { text-align:center; color:#1a237e; font-size:1.5rem; font-weight:bold; margin-bottom:2px; }
-#subtitle { text-align:center; color:#555; font-size:0.88rem; margin-bottom:10px; }
+.gradio-container {
+    max-width: 1000px !important;
+    margin: 0 auto !important;
+    padding: 8px !important;
+}
+#title {
+    text-align: center;
+    color: #1a237e;
+    font-size: clamp(1.1rem, 4vw, 1.5rem);
+    font-weight: bold;
+    margin-bottom: 2px;
+    line-height: 1.3;
+}
+#subtitle {
+    text-align: center;
+    color: #555;
+    font-size: clamp(0.75rem, 2.5vw, 0.88rem);
+    margin-bottom: 10px;
+    line-height: 1.4;
+}
 #disclaimer {
     background: #FFF8E1;
     border-left: 5px solid #F9A825;
     border-radius: 6px;
-    padding: 12px 18px;
-    margin: 10px 0 16px 0;
-    font-size: 0.86rem;
+    padding: 10px 14px;
+    margin: 8px 0 14px 0;
+    font-size: clamp(0.75rem, 2.5vw, 0.85rem);
     color: #5D4037;
     line-height: 1.6;
 }
 #disclaimer strong { color: #E65100; }
 #disclaimer a { color: #1565C0; font-weight: bold; }
-#status textarea { background:#E8F5E9 !important; color:#1B5E20 !important;
-                   border-left:4px solid #2E7D32 !important; font-size:0.85rem !important; }
-#footer { text-align:center; color:#aaa; font-size:0.75rem; margin-top:14px; }
+#status textarea {
+    background: #E8F5E9 !important;
+    color: #1B5E20 !important;
+    border-left: 4px solid #2E7D32 !important;
+    font-size: 0.82rem !important;
+}
+/* Make plots fill width on all screens */
+.js-plotly-plot, .plotly, .plot-container {
+    width: 100% !important;
+}
+#footer {
+    text-align: center;
+    color: #aaa;
+    font-size: clamp(0.7rem, 2vw, 0.75rem);
+    margin-top: 14px;
+    line-height: 1.6;
+}
+/* ── Tablet and up ── */
+@media (min-width: 600px) {
+    .gradio-container { padding: 16px !important; }
+}
 """
 
+# ── Gradio UI ─────────────────────────────────────────────────────────────────
 with gr.Blocks(title="Nepal Election 2082 — PR Results") as demo:
+
     gr.HTML("""
-        <div id='title'>🗳️ Nepal Election 2082 — Proportional Representation Results</div>
+        <div id='title'>🗳️ Nepal Election 2082 — PR Results</div>
         <div id='subtitle'>
             समानुपातिक निर्वाचनमा मतगणनाको आधारमा दलगत स्थिति &nbsp;|&nbsp;
             Live · <a href='https://result.election.gov.np/PRVoteChartResult2082.aspx'
@@ -268,15 +342,11 @@ with gr.Blocks(title="Nepal Election 2082 — PR Results") as demo:
         <div id='disclaimer'>
             ⚠️ <strong>Educational &amp; Learning Purpose Only</strong><br>
             This app is built for <strong>educational purposes only</strong> and is
-            <strong>not affiliated</strong> with the Election Commission of Nepal or
-            any political party. Data is fetched automatically from the EC website and
-            may be delayed or incomplete due to scraping limitations.<br><br>
-            👉 For <strong>official and accurate election results</strong>, always use the
-            authoritative source:
+            <strong>not affiliated</strong> with the Election Commission of Nepal or any
+            political party. Data may be delayed or incomplete due to scraping limitations.<br>
+            👉 For <strong>official results</strong> use:
             <a href='https://result.election.gov.np/PRVoteChartResult2082.aspx'
-               target='_blank'>
-               Election Commission of Nepal — result.election.gov.np
-            </a>
+               target='_blank'>Election Commission of Nepal — result.election.gov.np</a>
         </div>
     """)
 
@@ -285,21 +355,24 @@ with gr.Blocks(title="Nepal Election 2082 — PR Results") as demo:
     refresh_btn = gr.Button("🔄 Refresh Live Data", variant="primary", size="lg")
 
     with gr.Tabs():
-        with gr.Tab("📊 Chart 1 — Vote Share"):
+        with gr.Tab("📊 Vote Share"):
             chart1_out = gr.Plot(show_label=False)
-            gr.HTML("<p style='text-align:center;color:#888;font-size:0.8rem'>"
+            gr.HTML("<p style='text-align:center;color:#888;font-size:0.78rem;margin-top:4px'>"
                     "Parties &lt; 3% grouped as <b>Others</b></p>")
-        with gr.Tab("🏛️ Chart 2 — 110 Seat Allocation"):
+        with gr.Tab("🏛️ 110 Seat Allocation"):
             chart2_out = gr.Plot(show_label=False)
-            gr.HTML("<p style='text-align:center;color:#888;font-size:0.8rem'>"
-                    "Only parties ≥ 3% · <b>Largest Remainder</b> method · no Others group</p>")
-        with gr.Tab("📋 Seat Summary Table"):
+            gr.HTML("<p style='text-align:center;color:#888;font-size:0.78rem;margin-top:4px'>"
+                    "Only parties ≥ 3% &nbsp;·&nbsp; <b>Largest Remainder</b> method</p>")
+        with gr.Tab("📋 Summary Table"):
             table_out = gr.DataFrame(
                 headers=['Party','Votes','Vote %','PR Seats (110)'],
-                interactive=False)
+                interactive=False,
+            )
 
-    refresh_btn.click(fn=refresh_data,
-                      outputs=[chart1_out, chart2_out, table_out, status_box])
+    refresh_btn.click(
+        fn=refresh_data,
+        outputs=[chart1_out, chart2_out, table_out, status_box],
+    )
 
     gr.HTML("""
         <div id='footer'>
