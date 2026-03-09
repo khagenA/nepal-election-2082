@@ -4,13 +4,16 @@ emoji: 🗳️
 colorFrom: blue
 colorTo: red
 sdk: gradio
-sdk_version: "4.44.0"
 app_file: app.py
 pinned: false
 license: mit
 ---
 
 # 🗳️ Nepal Election 2082 — Proportional Representation Results
+
+[![GitHub Repo](https://img.shields.io/badge/GitHub-nepal--election--2082-181717?style=flat&logo=github)](https://github.com/YOUR_USERNAME/nepal-election-2082)
+[![Hugging Face Space](https://img.shields.io/badge/🤗%20Hugging%20Face-Space-yellow)](https://huggingface.co/spaces/YOUR_USERNAME/nepal-election-2082)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 > ⚠️ **DISCLAIMER — Educational Purpose Only**
 >
